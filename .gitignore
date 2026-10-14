@@ -1,0 +1,18 @@
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+
+# 测试产生的截图（可随时用 node tests/shot.mjs 重新生成）
+tests/screenshot-*.png
+tests/*-run.txt
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# 大体积素材原始档（保留压缩版）
+音乐原始档/

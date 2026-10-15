@@ -260,14 +260,20 @@
       return true;
     }).sort((a, b) => costOf(a) - costOf(b) || (b.power || 0) - (a.power || 0));
 
+    const deckFull = size(DATA.active) >= DECK_SIZE;
     wrap.innerHTML = list.map(c => {
       const n = cur[c.id] || 0;
-      const full = n >= MAX_COPY;
-      return `<div class="dp-tile${n ? " in-deck" : ""}${full ? " capped" : ""}" data-id="${c.id}" title="${esc(c.name)}｜${c.type}·费用${costTxt(c)}·${c.attr}${c.power != null ? "·战力" + c.power : ""}">
+      const capped = n >= MAX_COPY;                 // 同名已满 4 张
+      const blocked = capped || deckFull;           // 现在点它加不进去
+      // 明确写出「为什么加不了」，而不是点了没反应
+      const why = capped ? `同名已达上限 ${MAX_COPY} 张` : (deckFull ? `卡组已满 ${DECK_SIZE} 张，先移除一张` : "");
+      return `<div class="dp-tile${n ? " in-deck" : ""}${blocked ? " capped" : ""}" data-id="${c.id}"
+        title="${esc(c.name)}｜${c.type}·费用${costTxt(c)}·${c.attr}${c.power != null ? "·战力" + c.power : ""}${why ? "　— " + why : ""}">
         <img src="${c.img}" alt="${esc(c.name)}" loading="lazy">
         <span class="dp-cost">${costTxt(c)}</span>
         <span class="dp-attr" data-attr="${c.attr}">${c.attr}</span>
         ${n ? `<span class="dp-cnt">×${n}</span>` : `<span class="dp-add">＋</span>`}
+        ${blocked ? `<span class="dp-lock">${capped ? "满4" : "满"}</span>` : ""}
         <div class="dp-name">${esc(c.name)}</div>
       </div>`;
     }).join("") || `<div class="no-result" style="grid-column:1/-1;padding:40px 0">没有匹配的卡</div>`;

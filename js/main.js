@@ -146,7 +146,19 @@
   document.addEventListener("keydown", e => { if (e.key === "Escape") mask.classList.remove("open"); });
 
   // ===== 初始路由 =====
-  const hash = location.hash.replace("#", "");
-  show(pages.includes(hash) ? hash : "home");
+  // show() 里会写 location.hash，所以监听 hashchange 时要避免重复触发：
+  // 只在「当前 hash 指向的页面」和已激活页面不一致时才切。
+  const currentPage = () => {
+    const h = location.hash.replace("#", "");
+    return pages.includes(h) ? h : "home";
+  };
+  function syncFromHash() {
+    const want = currentPage();
+    const active = pages.find(p => document.getElementById("page-" + p).classList.contains("active"));
+    if (want !== active) show(want);
+  }
+  window.addEventListener("hashchange", syncFromHash);
+
+  show(currentPage());
   render();
 })();

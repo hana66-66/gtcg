@@ -383,10 +383,25 @@
   const swordCanAttack = side =>
     side.sword.onField && !side.sword.tapped && side.sword.summonedTurn !== S.turnCount;
 
-  // 可攻击的对手角色：默认仅疲劳（横置）；[突袭] 可打活跃（规则 6）
+  // [守护] 的锁定效果：对方场上有「活跃的守护角色」时，
+  // 攻击者只能攻击它 —— 既不能打其它角色，也不能打本体。
+  // （守护的本意就是替本体和其他角色挡刀，所以必须是强制目标，而不是可选拦截。）
+  const activeGuards = defSide => defSide.field.filter(u => hasGuard(u) && !u.tapped);
+  const guardLock = defSide => {
+    const g = activeGuards(defSide);
+    return g.length ? g : null;
+  };
+
+  // 可攻击的对手角色：
+  // · 有守护锁定 → 只能是那些守护者
+  // · 无守护 → 默认仅疲劳（横置）；[突袭] 可打活跃（规则 6）
   function attackableTargets(atkUnit, defSide) {
-    return defSide.field.filter(t => atkUnit && hasRaid(atkUnit) ? true : t.tapped);
+    const locked = guardLock(defSide);
+    if (locked) return locked.slice();
+    return defSide.field.filter(t => (atkUnit && hasRaid(atkUnit)) ? true : t.tapped);
   }
+  // 有守护角色在场时不能打本体
+  const canHitPlayer = defSide => !guardLock(defSide);
   const opp = side => (side === S.p ? S.a : S.p);
 
   // 战力被减到 0 ＝ 被击破（规则 6）
@@ -513,19 +528,164 @@
     fxLayer().appendChild(d);
     setTimeout(() => d.remove(), 1100);
   }
-  // 单位闪动（受击 / 攻击）
+  // 单位闪动（受击 / 攻击）。
+  // cls 可能是多个 class（如 "justAttack dr"），必须拆成 token 逐个传给
+  // classList —— 直接传带空格的字符串会抛 InvalidCharacterError，
+  // 而调用点在 battle() 里，异常会中断整个战斗结算（曾导致「攻击无法结算」）。
   function fxShake(uid, cls) {
     if (window.GTCG_FAST) return;
     const el = document.querySelector(`[data-uid="${uid}"]`);
     if (!el) return;
-    el.classList.remove(cls);
+    const tokens = String(cls).split(/\s+/).filter(Boolean);
+    if (!tokens.length) return;
+    el.classList.remove(...tokens);
     void el.offsetWidth;      // 强制重排以重启动画
-    el.classList.add(cls);
-    setTimeout(() => el.classList.remove(cls), 700);
+    el.classList.add(...tokens);
+    setTimeout(() => el.classList.remove(...tokens), 700);
   }
   const fx = (unit, text, cls) => fxAt(unit.uid, text, cls);
   const fxHit = unit => { fxShake(unit.uid, "justHit"); };
   const fxLunge = (unit, dir) => fxShake(unit.uid, "justAttack" + (dir < 0 ? " dl" : " dr"));
+
+  /* ============================================================
+     五之二、卡牌大图预览（双击放大）
+     ------------------------------------------------------------
+     双击场上单位 / 手牌 / 能量卡 / EX 区的冠军之剑，弹出大图 +
+     完整卡面信息。传入一组卡时可用 ←/→ 在同一批里翻页。
+     ============================================================ */
+
+  let zoomState = null;   // { cards, idx }
+
+  function zoomEnsure() {
+    let el = $("g-zoom");
+    if (el) return el;
+    el = document.createElement("div");
+    el.id = "g-zoom";
+    el.innerHTML = `
+      <div class="gz-box">
+        <span class="gz-close" id="gz-close">✕</span>
+        <span class="gz-nav prev" id="gz-prev">‹</span>
+        <span class="gz-nav next" id="gz-next">›</span>
+        <div class="gz-imgwrap"><img class="gz-img" id="gz-img" alt=""></div>
+        <div class="gz-info">
+          <div class="gz-name" id="gz-name"></div>
+          <div class="gz-badges" id="gz-badges"></div>
+          <div class="gz-stats" id="gz-stats"></div>
+          <div class="gz-eff" id="gz-eff"></div>
+          <div class="gz-kw" id="gz-kw"></div>
+          <div class="gz-note" id="gz-note" style="display:none"></div>
+          <div class="gz-flavor" id="gz-flavor" style="display:none"></div>
+        </div>
+        <div class="gz-hint">← → 翻页 · 点击空白处或按 Esc 关闭</div>
+      </div>`;
+    document.body.appendChild(el);
+    // 点遮罩空白处关闭（点卡片/信息面板本身不关）
+    el.addEventListener("click", e => { if (e.target === el) zoomClose(); });
+    el.querySelector("#gz-close").addEventListener("click", zoomClose);
+    el.querySelector("#gz-prev").addEventListener("click", e => { e.stopPropagation(); zoomStep(-1); });
+    el.querySelector("#gz-next").addEventListener("click", e => { e.stopPropagation(); zoomStep(1); });
+    return el;
+  }
+
+  function zoomOpen(card, cards) {
+    if (!card) return;
+    const list = (cards && cards.length) ? cards : [card];
+    let idx = list.indexOf(card);
+    if (idx < 0) { list.unshift(card); idx = 0; }
+    zoomState = { cards: list, idx };
+    zoomEnsure().classList.add("open");
+    zoomPaint();
+  }
+
+  // 把一侧战场上所有可见的卡收集成一份「可翻页」列表（角色 + 各自装备），
+  // 这样双击任意角色都能用 ←/→ 把这一侧看完。
+  // 冠军之剑开局就在 EX 区、满了共鸣后移至战场，两种状态都算「这一侧看得见的卡」。
+  // current 传「卡」或「单位」都可以：单位会自动取它的 card。
+  function zoomListFor(side, current) {
+    const want = current && current.card ? current.card : current;
+    const list = [];
+    side.field.forEach(u => {
+      list.push(u.card);
+      if (u.equipCard) list.push(u.equipCard);
+    });
+    if (!list.includes(SWORD)) list.push(SWORD);
+    // 当前卡必须在列表里（找不到就放到最前）
+    if (want && !list.includes(want)) list.unshift(want);
+    return list;
+  }
+
+  function zoomClose() {
+    const el = $("g-zoom");
+    if (el) el.classList.remove("open");
+    zoomState = null;
+  }
+
+  function zoomStep(d) {
+    if (!zoomState) return;
+    const n = zoomState.cards.length;
+    if (n < 2) return;
+    zoomState.idx = (zoomState.idx + d + n) % n;
+    zoomPaint();
+  }
+
+  function zoomPaint() {
+    if (!zoomState) return;
+    const c = zoomState.cards[zoomState.idx];
+    if (!c) return;
+    const set = (id, html) => { const el = $(id); if (el) el.innerHTML = html; };
+
+    $("gz-img").src = c.img;
+    $("gz-img").alt = c.name;
+    set("gz-name", c.name);
+
+    // 徽章：类型 / 属性 / 阵营 / 武器 / 专属
+    const badges = [`<span>${c.type}</span>`];
+    if (c.attr && c.attr !== "无") badges.push(`<span class="cy">属性 ${c.attr}</span>`);
+    (c.factions || []).forEach(f => badges.push(`<span class="cy">${f}</span>`));
+    (c.weapons || []).forEach(w => badges.push(`<span>${w}</span>`));
+    if (c.exclusiveTo) badges.push(`<span>${c.exclusiveTo}专属</span>`);
+    set("gz-badges", badges.join(""));
+
+    // 数值：费用 / 战力
+    const stats = [];
+    if (c.cost !== null && c.cost !== undefined) stats.push(`<div class="gz-stat"><b>${c.cost}</b><i>费用</i></div>`);
+    if (c.power !== null && c.power !== undefined) stats.push(`<div class="gz-stat"><b>${c.power}</b><i>战力</i></div>`);
+    set("gz-stats", stats.join(""));
+
+    // 效果文本
+    set("gz-eff", (c.text && c.text.length)
+      ? c.text.map(t => `<div>${t}</div>`).join("")
+      : `<div style="color:var(--muted);border-color:var(--border)">（无效果文本）</div>`);
+
+    // 关键词释义
+    set("gz-kw", (c.keywords && c.keywords.length)
+      ? c.keywords.map(k => `<div><b>【${k}】</b>${KEYWORD_DEFS[k] || ""}</div>`).join("")
+      : "");
+
+    const note = $("gz-note");
+    if (note) {
+      note.style.display = c.note ? "block" : "none";
+      note.textContent = c.note ? "※ " + c.note : "";
+    }
+    const fl = $("gz-flavor");
+    if (fl) {
+      fl.style.display = c.flavor ? "block" : "none";
+      fl.textContent = c.flavor || "";
+    }
+
+    const n = zoomState.cards.length;
+    const prev = $("gz-prev"), next = $("gz-next");
+    if (prev) prev.classList.toggle("hide", n < 2);
+    if (next) next.classList.toggle("hide", n < 2);
+  }
+
+  // 全局键位：Esc 关闭，←/→ 翻页（预览打开时才生效）
+  document.addEventListener("keydown", e => {
+    if (!zoomState) return;
+    if (e.key === "Escape") { zoomClose(); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); zoomStep(-1); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); zoomStep(1); }
+  });
 
   /* ============================================================
      六、弹窗（选择 / 支付 / 亮牌 / 整理）
@@ -728,6 +888,23 @@
       return;
     }
     const isSword = !!atkUnit.isSword;
+
+    // [守护] 锁定：对方有活跃守护角色时，只能攻击它。
+    // 打本体、或打其它角色都非法 —— 这里兜底拦一次，避免 UI 之外绕过。
+    if (!isSword) {
+      const locked = guardLock(defSide);
+      if (locked) {
+        if (target === "player") {
+          gToast(`对方有[守护]角色「${locked[0].card.name}」在场，只能先攻击它`);
+          return;
+        }
+        if (!locked.includes(target)) {
+          gToast(`对方有[守护]角色在场，只能攻击守护角色`);
+          return;
+        }
+      }
+    }
+
     const atkName = isSword ? "冠军之剑" : `「${atkUnit.card.name}」`;
     log(`${atkSide.name} 的 ${atkName} 宣告攻击 ${target === "player" ? "本体" : `「${target.card.name}」`}`);
 
@@ -747,13 +924,16 @@
     }
 
     // 2) 决定由谁接战（守护拦截）
-    //    · 攻击目标本身就是「活跃的守护角色」→ 它直接接战，无需再询问守护
+    //    · 攻击目标本身就是「活跃的守护角色」→ 它直接接战
     //    · 冠军之剑：目标若是角色，该角色就是阻挡者（阻挡剑必死）
+    //    · 其余情况交给 askGuard：对方有活跃守护者时由它顶上（守护是强制目标）
     let blocker = null;
     const targetIsGuardItself = target !== "player" && hasGuard(target) && !target.tapped;
     if (isSword && target !== "player") {
       blocker = target;
-    } else if (!targetIsGuardItself) {
+    } else if (targetIsGuardItself) {
+      blocker = target;          // 直接打守护者：它接战（结算后要横置）
+    } else {
       blocker = await askGuard(defSide, atkUnit, target, atkSide);
     }
 
@@ -857,33 +1037,27 @@
   }
 
   // [守护]：一回合一次，守护后横置；疲劳状态无法阻挡（规则 6）
+  // 注意：由于守护是「锁定目标」（见 guardLock），攻击者在有守护者时只能攻击它，
+  // 所以这里通常直接返回那个守护者，不再需要询问「用谁守护」。
   async function askGuard(defSide, atkUnit, target, atkSide) {
-    const guards = defSide.field.filter(u => hasGuard(u) && !u.tapped);
+    const guards = activeGuards(defSide);
     if (!guards.length) return null;
 
+    // 目标本身就是某个活跃守护者 → 由它接战
+    if (target !== "player" && guards.includes(target)) return target;
+
+    // 还有别的守护者挡着（多守护者时选一个能打赢的；打不赢也由它顶）
     if (defSide === S.a) {
       if (atkUnit.isSword) return null;   // 挡剑必死，AI 不挡
-      if (target !== "player") return null;
       const ap = effPower(atkUnit);
-      const g = guards.find(u => effPower(u) > ap);
-      if (g) { log(`AI 用「${g.card.name}」守护！`); return g; }
-      return null;
+      const g = guards.find(u => effPower(u) > ap) || guards[0];
+      log(`AI 用「${g.card.name}」守护！`);
+      return g;
     }
-
-    const opts = guards.map(u => ({
-      label: `「${u.card.name}」（战力 ${effPower(u)}）`,
-      sub: "与攻击者比战力（含反伤），守护后横置；一回合只能守护一次",
-      img: u.card.img,
-      value: u
-    }));
-    opts.push({ label: "不守护，硬吃这次攻击", value: null });
-    const atkLabel = atkUnit.isSword
-      ? "冠军之剑（战力视为无限大 —— 阻挡者必死！）"
-      : `「${atkUnit.card.name}」（战力 ${effPower(atkUnit)}）`;
-    const g = await choose(
-      `${atkSide.name} 的 ${atkLabel}攻击${target === "player" ? "你的本体" : `你的「${target.card.name}」`}——用谁守护？`,
-      opts);
-    if (g) log(`你用「${g.card.name}」守护！`);
+    // 玩家侧：也自动用守护者接战（守护是强制的，不给「不守护」选项）
+    const ap = effPower(atkUnit);
+    const g = guards.find(u => effPower(u) > ap) || guards[0];
+    log(`你用「${g.card.name}」守护！`);
     return g;
   }
 
@@ -1131,11 +1305,14 @@
       if (S.over) return;
       if (!canAttack(u) || u.tapped) continue;
       const ap = effPower(u);
-      // 优先打能赢的疲劳角色，否则打本体
-      const winnable = attackableTargets(u, foe).filter(t => ap > effPower(t));
-      const target = winnable.length
-        ? winnable.sort((a, b) => effPower(b) - effPower(a))[0]
-        : "player";
+      // 可攻击目标（已含守护锁定）；能赢就打，打不赢且本体可打就打本体
+      const targets = attackableTargets(u, foe);
+      const winnable = targets.filter(t => ap > effPower(t));
+      let target;
+      if (winnable.length) target = winnable.sort((a, b) => effPower(b) - effPower(a))[0];
+      else if (canHitPlayer(foe)) target = "player";
+      else target = targets[0] || null;          // 被守护锁住：只能打守护者
+      if (!target) continue;
       await declareAttack(me, foe, u, target);
       if (S.over) return;
       await sleep(500);
@@ -1147,22 +1324,33 @@
 
   async function aiTurn() {
     if (S.over) { busy = false; return; }
-    await sleep(600);
-    S.phase = "fill"; render();
-    aiFillEnergy(); render();
-    await sleep(600);
-    S.phase = "main"; render();
-    await aiMain();
-    if (S.over) { busy = false; return; }
-    await sleep(500);
-    S.phase = "battle"; render();
-    await aiBattle();
-    if (S.over) { busy = false; return; }
-    await sleep(400);
-    cleanupTurnEnd(S.a);
-    await startTurn(S.p);
-    busy = false;
-    render();
+    // 兜底：AI 回合是同步跑完的一整条 async 链，中间任何 await 抛异常
+    // （卡片效果里没预料到的状态、弹窗逻辑出错等）都会让 busy 永远停在 true，
+    // 表现为「AI 卡住不动、玩家也点不了」。这里用 try/finally 保证一定复位。
+    try {
+      await sleep(600);
+      S.phase = "fill"; render();
+      aiFillEnergy(); render();
+      await sleep(600);
+      S.phase = "main"; render();
+      await aiMain();
+      if (S.over) return;
+      await sleep(500);
+      S.phase = "battle"; render();
+      await aiBattle();
+      if (S.over) return;
+      await sleep(400);
+      cleanupTurnEnd(S.a);
+      await startTurn(S.p);
+    } catch (e) {
+      // 不让异常冒泡到调用方（否则 endTurn 的 await 会断，玩家回合也起不来）
+      console.error("[GTCG] AI 回合异常，已复位 busy：", e);
+      log("⚠ AI 行动出现异常，已跳过剩余步骤", "g-hot");
+      try { S.phase = "fill"; S.active = S.p; await startTurn(S.p); } catch (_) {}
+    } finally {
+      busy = false;
+      render();
+    }
   }
 
   /* ============================================================
@@ -1535,6 +1723,25 @@
       if (sub) sub.textContent = `${S.p.deckName}　VS　${S.a.deckName}　·　起手各 ${HAND_START} 张`;
     }
 
+    // 阶段提示：战斗阶段前的每一步都告诉玩家该干什么，避免「不知道怎么攻击」
+    const prompt = $("g-phase-prompt");
+    if (prompt) {
+      let msg = "";
+      if (S.started && !S.over && S.active === S.p && !busy) {
+        if (S.phase === "fill") {
+          msg = S.p.filledThisTurn
+            ? "已填能量 —— 点右上「跳过填能 → 主要阶段」开始出牌"
+            : "填能阶段：拖 1 张手牌到下方费用区填入";
+        } else if (S.phase === "main") {
+          msg = "主要阶段：拖手牌到自己半场打出角色 / 事件，装备拖到角色身上";
+        } else if (S.phase === "battle") {
+          msg = "战斗阶段：点自己场上的角色发起攻击（拖到敌方角色或对面半场也可以）";
+        }
+      }
+      prompt.textContent = msg;
+      prompt.classList.toggle("show", !!msg);
+    }
+
     // 顶栏：我的信息
     setText("my-deck-name", S.p.deckName);
     setText("my-hand-num", S.p.hand.length);
@@ -1647,32 +1854,63 @@
     syncFillZone();
   }
 
-  const clearTargets = () => document.querySelectorAll(".atk-target").forEach(x => x.classList.remove("atk-target"));
+  const clearTargets = () => document.querySelectorAll(".atk-target").forEach(x => {
+    x.classList.remove("atk-target", "guard-locked");
+  });
   function markTargets(u) {
     clearTargets();
+    // 用 attackableTargets 统一判定（已含守护锁定），亮出的就是唯一合法目标
+    const ok = attackableTargets(u, S.a);
+    const locked = !!guardLock(S.a);
     $("z-field-a").querySelectorAll(".g-unit").forEach(el => {
       const t = S.a.field.find(x => x.uid === el.dataset.uid);
-      if (t && attackableTargets(u, S.a).includes(t)) el.classList.add("atk-target");
+      if (t && ok.includes(t)) {
+        el.classList.add("atk-target");
+        if (locked) el.classList.add("guard-locked");   // 金色「守」标，提示这是被锁定的目标
+      }
     });
+    // 有守护锁定时本体不可打，把对面半场的高亮也关掉
+    const mat = $("g-mat");
+    if (mat) mat.classList.toggle("body-locked", locked);
   }
 
   // 玩家发起一次攻击的公共入口（点击与拖拽共用）
   async function playerAttack(unit, target) {
     busy = true;
     render();
-    await declareAttack(S.p, S.a, unit, target);
-    busy = false;
-    render();
+    // try/finally：攻击结算里任何异常都不能把 busy 永久留在 true，
+    // 否则整局「点什么都没反应」，看起来就是卡死。
+    try {
+      await declareAttack(S.p, S.a, unit, target);
+    } catch (e) {
+      console.error("[GTCG] 攻击结算异常：", e);
+      gToast("攻击结算出错，已中断本次攻击");
+    } finally {
+      busy = false;
+      render();
+    }
   }
 
   // 点击单位 → 弹出攻击目标菜单
   async function attackMenu(u) {
-    const opts = [{ label: "直接攻击对方本体", sub: "命中 +1 共鸣值", value: "player" }];
+    const opts = [];
+    const locked = guardLock(S.a);
+    const canBody = canHitPlayer(S.a);
+    if (canBody) {
+      opts.push({ label: "直接攻击对方本体", sub: "命中 +1 共鸣值", value: "player" });
+    } else {
+      opts.push({
+        label: "对方有[守护]角色，无法攻击本体",
+        sub: `必须先击破守护角色「${locked[0].card.name}」`,
+        value: null
+      });
+    }
     attackableTargets(u, S.a).forEach(t => {
       const raid = hasRaid(u) && !t.tapped;
+      const isGuard = hasGuard(t) && !t.tapped;
       opts.push({
-        label: `${raid ? "[突袭] " : ""}攻击「${t.card.name}」（${t.tapped ? "疲劳" : "活跃"}·战力 ${effPower(t)}）`,
-        sub: `你的战力 ${effPower(u)}，含反伤`,
+        label: `${isGuard ? "[守护] " : (raid ? "[突袭] " : "")}攻击「${t.card.name}」（${t.tapped ? "疲劳" : "活跃"}·战力 ${effPower(t)}）`,
+        sub: isGuard ? "对方守护角色——只能先打它" : `你的战力 ${effPower(u)}，含反伤`,
         img: t.card.img,
         value: t
       });
@@ -1693,13 +1931,22 @@
       e.dataTransfer.effectAllowed = "copyMove";
     });
     el.addEventListener("dragend", () => endDrag());
-    // 桌面：单击手牌 = 直接尝试打出 / 填能（不必拖拽）。
-    // 之前只有移动端 pointerdown 旁路会弹菜单，桌面点一下毫无反应 —— 这是「牌下不了」的主因。
+    // 出牌一律走拖拽（拖到自己半场 / 拖到角色身上装备 / 拖到费用区填能）。
+    // 单击只用来「看卡」：弹一下卡牌信息，不代打 —— 之前单击直接出牌太容易误触。
     el.addEventListener("click", e => {
-      if (e.detail > 1) return;          // 双击不重复处理
-      if (busy || S.over || S.active !== S.p || !S.started) return;
+      if (e.detail > 1) return;          // 双击交给 dblclick 放大预览
+      if (busy || S.over || !S.started) return;
       const c = S.p.hand[+el.dataset.i];
-      if (c) handCardMenu(c);
+      if (!c) return;
+      if (S.active !== S.p) { gToast("现在是 AI 的回合，稍等一下"); return; }
+      gToast(hintForCard(c));
+    });
+    // 双击手牌 = 放大看卡图
+    el.addEventListener("dblclick", e => {
+      e.preventDefault();
+      e.stopPropagation();
+      const i = +el.dataset.i;
+      if (S.p.hand[i]) zoomOpen(S.p.hand[i], S.p.hand.slice());
     });
     // 移动端：触摸拖拽旁路（鼠标仍走上面的 HTML5 DnD）
     el.addEventListener("pointerdown", e => {
@@ -1750,12 +1997,24 @@
       render();
     };
 
-    // 点击 → 战斗阶段弹出攻击目标；否则显示详情
+    // 点击 → 战斗阶段弹出攻击目标；否则提示为什么不能攻击
     el.addEventListener("click", async () => {
       const u = S.p.field.find(x => x.uid === el.dataset.uid);
       if (!u || busy || S.over || S.active !== S.p) return;
-      if (S.phase === "battle" && canAttack(u)) await attackMenu(u);
-      else showUnitInfo(u);
+      if (S.phase === "battle") {
+        if (canAttack(u)) await attackMenu(u);
+        else gToast(noAttackReason(u));
+      } else {
+        showUnitInfo(u);
+      }
+    });
+    // 双击 = 放大看卡图；同一侧场上的角色可一起翻页（含各自的装备）
+    el.addEventListener("dblclick", e => {
+      e.preventDefault();
+      e.stopPropagation();
+      const u = S.p.field.find(x => x.uid === el.dataset.uid);
+      if (!u) return;
+      zoomOpen(u.card, zoomListFor(S.p, u.card));
     });
 
     el.addEventListener("pointerdown", e => {
@@ -1782,7 +2041,12 @@
       dragUnit = null;
       if (!t) return;
       if (!attackableTargets(u, S.a).includes(t)) {
-        gToast("只能攻击疲劳（横置）的角色——[突袭] 才能打活跃角色");
+        const locked = guardLock(S.a);
+        if (locked) {
+          gToast(`对方有[守护]角色「${locked[0].card.name}」在场，只能先攻击它`);
+        } else {
+          gToast("只能攻击疲劳（横置）的角色——[突袭] 才能打活跃角色");
+        }
         return;
       }
       await playerAttack(u, t);
@@ -1790,6 +2054,14 @@
     el.addEventListener("click", () => {
       const t = S.a.field.find(x => x.uid === el.dataset.uid);
       if (t && !busy) showUnitInfo(t);
+    });
+    // 双击 = 放大看对手角色卡图；该侧场上所有卡可一起翻页
+    el.addEventListener("dblclick", e => {
+      e.preventDefault();
+      e.stopPropagation();
+      const t = S.a.field.find(x => x.uid === el.dataset.uid);
+      if (!t) return;
+      zoomOpen(t.card, zoomListFor(S.a, t.card));
     });
   }
 
@@ -1800,6 +2072,7 @@
       if (busy || S.over || S.active !== S.p || S.phase !== "battle" || !swordCanAttack(S.p)) return;
       await playerAttack({ isSword: true, card: SWORD, uid: "sword-p" }, "player");
     });
+    el.addEventListener("dblclick", e => { e.preventDefault(); e.stopPropagation(); zoomOpen(SWORD, [SWORD]); });
   }
 
   // 单位详情（点击非战斗状态时显示）
@@ -1808,6 +2081,17 @@
     const badges = unitBadges(u);
     gToast(`「${u.card.name}」战力 ${p}${u.tapped ? " · 疲劳" : " · 活跃"}` +
       (badges.length ? " · " + badges.map(b => b.tip).join(" · ") : ""));
+  }
+
+  // 为什么这个角色现在不能攻击 —— 战斗阶段点它时给出明确原因
+  function noAttackReason(u) {
+    if (u.tapped) return "这个角色本回合已经攻击过（或已被横置），下回合恢复";
+    if (u.refreshedNoAttack) return "这个角色刚被[重整]，本回合不能攻击";
+    if (u.cannotAttack) return "这个角色本身不能攻击";
+    if (u.playedTurn === S.turnCount && u.resonanceTurn !== S.turnCount) {
+      return "本回合刚登场的角色不能攻击，下回合才行";
+    }
+    return "现在不能攻击";
   }
 
   // 每帧刷新的部分（属性赋值幂等，不会累积监听）
@@ -1822,7 +2106,8 @@
 
     mat.ondragover = e => {
       if (dragUnit) {
-        const bodyOk = S.phase === "battle" && halfOf(e) === "a";
+        // 有守护锁定时不能打本体，对面半场不再高亮为可放置
+        const bodyOk = S.phase === "battle" && halfOf(e) === "a" && canHitPlayer(S.a);
         mat.classList.toggle("body-ok", bodyOk);
         if (bodyOk) e.preventDefault();
         return;
@@ -1848,6 +2133,11 @@
         dragUnit = null;
         if (mine) { gToast("攻击本体请拖到对面的半场（上半场）"); return; }
         if (S.phase !== "battle") { gToast("只能在战斗阶段攻击：请先点「进入战斗阶段」"); return; }
+        if (!canHitPlayer(S.a)) {
+          const g = guardLock(S.a)[0];
+          gToast(`对方有[守护]角色「${g.card.name}」在场，只能先攻击它`);
+          return;
+        }
         await playerAttack(u, "player");
         return;
       }
@@ -2088,7 +2378,31 @@
     tdTeardown();
   }
 
-  // 手牌操作菜单：点一下手牌就能打出 / 填能（拖拽仍是备选）
+  // 单击手牌时给的提示：告诉玩家「这张牌现在能拖到哪、为什么不能拖」。
+  // 出牌本身一律靠拖拽，点击只负责解释，避免误触。
+  function hintForCard(card) {
+    const phase = S.phase;
+    const isEquip = card.type === "装备";
+    if (phase === "fill") {
+      if (S.p.filledThisTurn) return "本回合已填过能量 —— 拖到费用区可填，但本回合限 1 张";
+      return `拖「${card.name}」到下方费用区即可填入能量（每回合限 1 张）`;
+    }
+    if (phase === "main") {
+      if (!canPay(S.p, card)) return `费用不足：需要 ${card.cost} 费${card.attr !== "无" ? "（含 1 张" + card.attr + "属性）" : ""}`;
+      if (isEquip) {
+        const targets = S.p.field.filter(u => equipOk(u, card));
+        return targets.length
+          ? `拖「${card.name}」到要装备的角色身上（${targets.map(u => u.card.name).join("、")}）`
+          : "场上没有能装备这张武器的角色";
+      }
+      return `拖「${card.name}」到你自己的半场即可打出（费用 ${card.cost}）`;
+    }
+    if (phase === "battle") return "战斗阶段只能发起攻击 —— 点或拖自己场上的角色";
+    if (phase === "draw") return "现在是抽牌阶段，稍等一下";
+    return "现在不能使用这张卡";
+  }
+
+  // 手牌操作菜单：移动端长按/点选时的快捷入口（桌面以拖拽为主）
   async function handCardMenu(card) {
     if (!card || S.over || busy || S.active !== S.p || !S.started) return;
     const opts = [];
@@ -2113,17 +2427,15 @@
       if (!targets.length) opts.push({ label: "没有可装备的角色", sub: "先把角色打到场上", value: "noop" });
     }
     if (S.phase === "fill" && !S.p.filledThisTurn) {
-      opts.push({ label: `填入能量区`, sub: "本回合限填 1 张，活跃状态入区", img: card.img, value: "fill" });
+      opts.push({ label: "填入能量区", sub: "本回合限填 1 张，活跃状态入区", img: card.img, value: "fill" });
     }
-    if (!opts.length) { gToast(noActionReason(card)); return; }
+    if (!opts.length) { gToast(hintForCard(card)); return; }
 
-    // 只有一个可行操作时直接执行，省掉一次点击
     let v;
     if (opts.length === 1 && opts[0].value !== "noop") {
       v = opts[0].value;
     } else {
-      const withCancel = [...opts, { label: "取消", value: null }];
-      v = await choose(`「${card.name}」要做什么？`, withCancel);
+      v = await choose(`「${card.name}」要做什么？`, [...opts, { label: "取消", value: null }]);
     }
 
     if (v === "play") {
@@ -2277,6 +2589,36 @@
 
     // 卡组改动（重命名/构筑）后刷新对局状态栏显示
     if (window.GTCG_DECKS) window.GTCG_DECKS.onChange = () => { if (S) render(); };
+
+    // 事件委托：能量卡与 EX 区的冠军之剑是批量渲染的（没有逐个 bind），
+    // 这里用一次委托覆盖它们，双击即可放大看卡图。
+    const mat = $("g-mat");
+    if (mat) {
+      mat.addEventListener("dblclick", e => {
+        const t = e.target;
+        // 能量卡：<img class="g-energy"> —— 用序号回到 state 取原卡
+        if (t.classList && t.classList.contains("g-energy")) {
+          const inMine = t.closest("#z-energy");
+          const inFoe = t.closest("#z-energy-a");
+          const zone = inMine || inFoe;
+          if (!zone) return;
+          const idx = [...zone.querySelectorAll(".g-energy")].indexOf(t);
+          const side = inMine ? S.p : S.a;
+          const entry = side.energy[idx];
+          if (!entry) return;
+          e.preventDefault();
+          e.stopPropagation();
+          zoomOpen(entry.card, side.energy.map(x => x.card));
+          return;
+        }
+        // EX 区待命的冠军之剑
+        if (t.classList && t.classList.contains("g-ex-sword")) {
+          e.preventDefault();
+          e.stopPropagation();
+          zoomOpen(SWORD, [SWORD]);
+        }
+      });
+    }
   }
 
   /* ============================================================
@@ -2344,6 +2686,17 @@
       overflow: () => document.documentElement.scrollHeight - window.innerHeight
     },
     handCardMenu,
+    zoom: {
+      open: zoomOpen,
+      close: zoomClose,
+      step: zoomStep,
+      get state() {
+        return zoomState
+          ? { idx: zoomState.idx, n: zoomState.cards.length, cards: zoomState.cards.map(c => c && c.id) }
+          : null;
+      },
+      shown: () => { const el = $("g-zoom"); return !!el && el.classList.contains("open"); }
+    },
     td: { get state() { return { on: TD.on, kind: TD.kind, moved: TD.moved, hover: !!TD.hover }; } },
     endTurn: async () => { await endTurn(); },
     // 卡牌行为登记表（便于测试逐张验证）
@@ -2351,7 +2704,8 @@
     core: {
       tryPay, canPay, effPower, addResonance, pickPayment, choosePayment, payFor,
       destroy, bounce, hasGuard, hasRaid, canAttack, attackableTargets, battle,
-      checkDestroy, fillEnergy, playCard, declareAttack, cleanupTurnEnd, startTurn
+      checkDestroy, fillEnergy, playCard, declareAttack, cleanupTurnEnd, startTurn,
+      activeGuards, guardLock, canHitPlayer
     },
     render
   };
